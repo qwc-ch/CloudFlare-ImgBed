@@ -6,8 +6,7 @@ permissions:
   issues: write
 
 on:
-  schedule:
-    - cron: "0 0 * * *" # every day
+  # 已关闭每日自动同步（避免自动同步覆盖本地修改），如需同步请手动触发
   workflow_dispatch:
     inputs:
       confirm_breaking_update:

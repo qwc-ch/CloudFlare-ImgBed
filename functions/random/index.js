@@ -13,6 +13,9 @@ const corsHeaders = {
 let othersConfig = {};
 let allowRandom = false;
 
+// 文件列表缓存版本号：变更后旧的（可能已被空列表毒化的）边缘节点缓存自动失效
+const FILE_LIST_CACHE_VERSION = 'v2';
+
 export async function onRequest(context) {
     // Contents of context object
     const {
@@ -92,6 +95,11 @@ export async function onRequest(context) {
     // 调用randomFileList接口，读取KV数据库中的所有记录
     let allRecords = await getRandomFileList(context, requestUrl, dir);
 
+    // 索引读取失败：返回503让客户端重试，不能当作“空目录”返回200
+    if (allRecords === null) {
+        return new Response(JSON.stringify({ error: "Failed to read file index" }), { status: 503, headers: corsHeaders });
+    }
+
     // 筛选出符合fileType要求的记录
     allRecords = allRecords.filter(item => { return fileType.some(type => item.FileType?.includes(type)) });
 
@@ -131,7 +139,8 @@ export async function onRequest(context) {
     }
 
     if (allRecords.length == 0) {
-        return new Response(JSON.stringify({}), { status: 200, headers: responseHeaders });
+        // 空结果返回503而非200 {}：200会让<img>当成损坏图片，且可能被中间层缓存
+        return new Response(JSON.stringify({ error: "No image found" }), { status: 503, headers: responseHeaders });
     } else {
         const randomIndex = Math.floor(Math.random() * allRecords.length);
         const randomKey = allRecords[randomIndex];
@@ -175,15 +184,21 @@ export async function onRequest(context) {
 async function getRandomFileList(context, url, dir) {
     // 检查缓存中是否有记录，有则直接返回
     const cache = caches.default;
-    const cacheRes = await cache.match(`${url.origin}/api/randomFileList?dir=${dir}`);
+    const cacheKey = `${url.origin}/api/randomFileList?dir=${dir}&v=${FILE_LIST_CACHE_VERSION}`;
+    const cacheRes = await cache.match(cacheKey);
     if (cacheRes) {
         return JSON.parse(await cacheRes.text());
     }
 
-    let allRecords = await readIndex(context, { directory: dir, count: -1, includeSubdirFiles: true, accessStatus: 'normal' });
+    const indexResult = await readIndex(context, { directory: dir, count: -1, includeSubdirFiles: true, accessStatus: 'normal' });
+
+    // 索引读取失败时返回null，由调用方返回503；绝不能把失败当成“空目录”缓存
+    if (!indexResult || indexResult.success !== true) {
+        return null;
+    }
 
     // 仅保留记录的name和metadata中的必要字段
-    allRecords = allRecords.files?.map(item => {
+    const allRecords = (indexResult.files || []).map(item => {
         return {
             name: item.id,
             FileType: item.metadata?.FileType,
@@ -192,14 +207,16 @@ async function getRandomFileList(context, url, dir) {
         }
     });
 
-    // 缓存结果，缓存时间为24小时
-    await cache.put(`${url.origin}/api/randomFileList?dir=${dir}`, new Response(JSON.stringify(allRecords), {
-        headers: {
-            "Content-Type": "application/json",
-        }
-    }), {
-        expirationTtl: 24 * 60 * 60
-    });
-    
+    // 只缓存非空结果，避免空列表在边缘节点上被缓存24小时
+    if (allRecords.length > 0) {
+        await cache.put(cacheKey, new Response(JSON.stringify(allRecords), {
+            headers: {
+                "Content-Type": "application/json",
+            }
+        }), {
+            expirationTtl: 24 * 60 * 60
+        });
+    }
+
     return allRecords;
 }
